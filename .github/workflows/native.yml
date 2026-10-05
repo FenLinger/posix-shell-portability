@@ -49,7 +49,7 @@ jobs:
           cleanup() {
             rc=$?
             if [ -f "$work/qemu.pid" ]; then
-              pid=$(cat "$work/qemu.pid")
+              pid=$(sudo cat "$work/qemu.pid")
               if [[ "$pid" =~ ^[0-9]+$ ]] && sudo cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | grep -Fq -- "$uuid"; then
                 sudo kill "$pid" || true
               fi
