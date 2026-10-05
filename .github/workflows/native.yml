@@ -290,7 +290,7 @@ jobs:
                           if value and predicate(value):return value
                           time.sleep(1)
                       if system=="Windows":
-                          diagnostic=ps("$t=Get-ScheduledTask -TaskName $env:CI_CONTROL_TASK; $i=Get-ScheduledTaskInfo -TaskName $env:CI_CONTROL_TASK; [pscustomobject]@{task_state=[string]$t.State;last_result=$i.LastTaskResult;last_run_time=[string]$i.LastRunTime;restart_count=$t.Settings.RestartCount;restart_interval=$t.Settings.RestartInterval} | ConvertTo-Json -Compress",False)
+                          diagnostic=ps("$t=Get-ScheduledTask -TaskName $env:CI_CONTROL_TASK; $i=Get-ScheduledTaskInfo -TaskName $env:CI_CONTROL_TASK; [pscustomobject]@{task_state=[string]$t.State;last_result=$i.LastTaskResult;last_run_time=[string]$i.LastRunTime;restart_count=$t.Settings.RestartCount;restart_interval=$t.Settings.RestartInterval;watchdog_interval=($t.Triggers | Where-Object {$_.Repetition.Interval -eq 'PT1M'} | Select-Object -First 1).Repetition.Interval;next_run=[string](Get-ScheduledTaskInfo -TaskName $env:CI_CONTROL_TASK).NextRunTime;recovery_strategy='bounded-native-periodic-trigger-IgnoreNew'} | ConvertTo-Json -Compress",False)
                           print(json.dumps({"failure_diagnostic":diagnostic.stdout,"worker_state":state(),"identity":identity}),flush=True)
                       raise RuntimeError("Worker observation deadline expired")
                   def snapshot(phase,value):
@@ -328,15 +328,16 @@ jobs:
           $action=New-ScheduledTaskAction -Execute $env:CI_CONTROL_PYTHON -Argument ('"'+$env:CI_CONTROL_WORKER+'" "'+$env:CI_CONTROL_ROOT+'" '+$env:CI_CONTROL_TOKEN)
           $principal=New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
           $trigger=New-ScheduledTaskTrigger -AtLogOn -User $sid
-          $settings=New-ScheduledTaskSettingsSet -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-          Register-ScheduledTask -TaskName $env:CI_CONTROL_TASK -Action $action -Principal $principal -Trigger $trigger -Settings $settings -Force | Out-Null
+          $watchdog=New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(45) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Minutes 5)
+          $settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+          Register-ScheduledTask -TaskName $env:CI_CONTROL_TASK -Action $action -Principal $principal -Trigger @($trigger,$watchdog) -Settings $settings -Force | Out-Null
           Start-ScheduledTask -TaskName $env:CI_CONTROL_TASK
           $t=Get-ScheduledTask -TaskName $env:CI_CONTROL_TASK
-          [pscustomobject]@{supervisor='TaskScheduler';user_sid=$sid;principal=$t.Principal.UserId;logon_type=[string]$t.Principal.LogonType;state=[string]$t.State;restart_count=$t.Settings.RestartCount;restart_interval=$t.Settings.RestartInterval} | ConvertTo-Json -Compress
+          [pscustomobject]@{supervisor='TaskScheduler';user_sid=$sid;principal=$t.Principal.UserId;logon_type=[string]$t.Principal.LogonType;state=[string]$t.State;restart_count=$t.Settings.RestartCount;restart_interval=$t.Settings.RestartInterval;watchdog_interval=($t.Triggers | Where-Object {$_.Repetition.Interval -eq 'PT1M'} | Select-Object -First 1).Repetition.Interval;next_run=[string](Get-ScheduledTaskInfo -TaskName $env:CI_CONTROL_TASK).NextRunTime;recovery_strategy='bounded-native-periodic-trigger-IgnoreNew'} | ConvertTo-Json -Compress
           ''')
                           registered=True;print(registration.stdout.strip(),flush=True)
                           info=json.loads(registration.stdout)
-                          assert info["logon_type"]=="Interactive" and info["restart_count"]==2
+                          assert info["logon_type"]=="Interactive" and info["watchdog_interval"]=="PT1M"
                       first=wait_state(lambda s:s["count"]>=2)
                       second=wait_state(lambda s:s["pid"]==first["pid"] and s["count"]>first["count"])
                       snapshot("after_launcher_exit",second);emit("parent_exit")
@@ -362,7 +363,7 @@ jobs:
                           automatic=False;emit("supervisor_restart","failed")
                           restart()
                           recovered=wait_state(lambda s:s["pid"]!=second["pid"] and s["loaded"]>=second["count"] and s["count"]>second["count"],timeout=30)
-                      snapshot("after_worker_failure" if automatic else "manual_recovery_after_auto_failure",recovered)
+                      snapshot(("scheduled_recovery_after_worker_failure" if system=="Windows" else "after_worker_failure") if automatic else "manual_recovery_after_auto_failure",recovered)
                       emit("checkpoint_reload")
                       if automatic:emit("supervisor_restart")
                       (root/"stop-intent").write_text(token,encoding="utf-8",newline="\n")
@@ -402,6 +403,7 @@ jobs:
                       print(json.dumps({"schema":"hosted-native-lifecycle/1","summary":True,"identity":identity,
                           "required_controls":len(REQUIRED),"exit_code":rc,
                           "outcomes":{c:outcomes.get(c,"not-observed") for c in sorted(REQUIRED)},
+                          "recovery_strategy":"bounded-native-periodic-trigger-IgnoreNew" if system=="Windows" else "launchd-KeepAlive-SuccessfulExit-false",
                           "limitations":["hosted job lifetime only","no host reboot or new Windows logon","synthetic worker, not private harness","no persistent protected-host acceptance"]}),flush=True)
                   if rc:raise RuntimeError("Lifecycle probe failed")
           
