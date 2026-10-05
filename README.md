@@ -1,43 +1,89 @@
 # POSIX shell portability
 
-A small Python resolver selects a usable POSIX shell on Linux, macOS and native
-Windows, excluding the System32 WSL launcher. On Windows, install Git for Windows.
-Python 3.11 or later is required. No additional Python packages are needed.
+A small Python module for selecting Bash and building portable shell-script
+arguments on Linux, macOS and native Windows. On Windows it prefers Bash from
+Git for Windows and excludes a launcher found under System32.
 
-Run `python ci/probe.py` to execute the five resolver tests and a real Bash
-subprocess through a Unicode path containing spaces. The command prints structured
-JSON and fails if a required check fails or skips. Host diagnostics are reported
-separately from test results.
+## Install
 
-The published resolver matrix uses standard public Ubuntu, Windows and macOS
-runners, with at most two concurrent jobs and ten minutes per matrix job. Pushes
-to `ci-validation` run the matrix. Manual dispatch becomes available when the
-workflow is present on the default branch. Results stay in logs and job summaries;
-no artifacts or caches are uploaded.
+Use Python 3.11 or later and an installed Bash. Native Windows needs Git for
+Windows. There are no third-party Python dependencies, package downloads or
+build steps. Copy or unpack this source directory into your chosen location;
+the module lives at `viewer/tools/posix_shell.py`.
 
-The workflow includes an experimental fifteen-minute Ubuntu job after
-the resolver matrix. It boots one disposable Ubuntu 24.04 x86_64 KVM guest with
-at most two virtual CPUs and 2 GiB RAM. A synthetic systemd user heartbeat tests
-launching SSH-parent exit, supervisor restart, recovery across a real reboot of
-the same guest and disk, and explicit stop across a second guest reboot. The
-unchanged public resolver tests and probe also run inside that guest. Nested
-virtualization is experimental; runtime results, including unavailability, are
-required before any environment predicate can be credited.
+Run commands below from the unpacked directory. Copy the module into your Python
+application, or add `viewer/tools` to your application's import path.
 
-The lifecycle experiment is generic environment diagnostics. It does not prove
-authenticated application workflows, trust acceptance, Windows
-logon recovery, Metal execution, outer-host reboot, or persistence across CI jobs.
-No private code, credentials or external persistent host is used.
+## Quick start
+
+Find the shell:
+
+```bash
+python -c "import sys; sys.path.insert(0, 'viewer/tools'); from posix_shell import posix_shell; print(posix_shell())"
+```
+
+Run an existing script without shell-string interpolation:
+
+```python
+import subprocess
+import sys
+
+sys.path.insert(0, "viewer/tools")
+from posix_shell import bash_argv
+
+subprocess.run(bash_argv("my script.sh", "an argument with spaces"), check=True)
+```
+
+## API
+
+`posix_shell(which=shutil.which, exists=os.path.exists, os_name=os.name)` returns
+a shell path as `str`, or `None` when no candidate is found. The injectable
+`which`, `exists` and `os_name` parameters support deterministic resolver tests.
+
+The search order is `/bin/bash` on a non-Windows host, Bash adjacent to a
+resolved Git executable, then `bash` or `sh` on PATH outside System32. Git's
+candidate locations are `bin/bash.exe`, `usr/bin/bash.exe` and `bin/bash`.
+
+`bash_argv(script, *args)` returns a `list[str]` containing the shell, the script
+path rendered with POSIX separators, and the supplied argument strings. Pass it
+directly to `subprocess.run`. If resolution fails, it uses the bare name `bash`;
+execution may then raise an error. It neither executes nor validates the script.
+
+## Tests and diagnostics
+
+```bash
+python ci/probe.py
+```
+
+The probe executes five resolver unit tests and one real Bash subprocess through
+a path containing spaces and Unicode. It fails if a required test fails, errors
+or skips, or if the subprocess's Unicode output differs from the expected bytes.
+It prints a JSON record with counts, exits, timings, runtime details and Python
+source hashes. Git and platform diagnostics are separate from the pass decision.
+
+The optional GitHub Actions workflow tests the same probe on standard Ubuntu,
+macOS and native Windows runners, using Python 3.11.9, at most two concurrent
+jobs, and a ten-minute limit per job. It writes results to logs and job summaries
+without uploading artifacts or caches. Pushes to `ci-validation` trigger the
+matrix; manual dispatch requires the workflow on the repository's default branch.
+
+## Scope and limitations
+
+This package selects a shell; it does not install Bash, translate shell syntax
+or convert paths between different filesystems. Resolution checks locations,
+not executable versions or permissions. The PATH fallback can select `sh`;
+scripts needing Bash features should use a host with Bash installed. Unit tests
+with injected Windows paths are distinct from actual execution on Windows.
+
+There are no hardware, persistent-service, authentication, reboot or logon
+guarantees. The package contains no private datasets, research corpus or agent
+configuration.
 
 ## Licensing
 
 The open-source license is **AGPL-3.0-only**; see [LICENSE](LICENSE).
-Commercial use is permitted under the AGPL's conditions.
+Commercial use is permitted under its conditions.
 
-A **paid proprietary license** is available by separate written agreement with
-the project maintainer. It can provide alternative permissions for uses that
-need proprietary terms. See [LICENSING.md](LICENSING.md) for the licensing options.
-
-The resolver is published at `FenLinger/posix-shell-portability` on
-`ci-validation`. The lifecycle experiment remains unvalidated until actual job
-results establish its declared checks.
+A **paid proprietary license** is available by separate executed agreement for
+rights controlled by the licensor. No proprietary grant or automatic assignment
+of contribution rights is made here. See [LICENSING.md](LICENSING.md).
