@@ -26,3 +26,160 @@ jobs:
           python-version: '3.11.9'
       - name: Tests and host diagnostics
         run: python ci/probe.py
+  persistence_guest:
+    needs: probe
+    # Experimental generic Linux guest diagnostics.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Same-guest lifecycle feasibility (synthetic data only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          stage=preflight
+          work=$(mktemp -d)
+          uuid=$(cat /proc/sys/kernel/random/uuid)
+          required=(image_verification guest_boot public_resolver parent_exit supervisor_restart guest_reboot_recovery explicit_stop_reboot)
+          declare -A outcomes=()
+          emit() { outcomes["$1"]=$2; printf '{"schema":"public-guest-lifecycle/1","control":"%s","outcome":"%s","scope":"diagnostics-only"}\n' "$1" "$2"; }
+          cleanup() {
+            rc=$?
+            if [ -f "$work/qemu.pid" ]; then
+              pid=$(cat "$work/qemu.pid")
+              if [[ "$pid" =~ ^[0-9]+$ ]] && sudo cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | grep -Fq -- "$uuid"; then
+                sudo kill "$pid" || true
+              fi
+            fi
+            rm -rf "$work"
+            if [ "$rc" -ne 0 ]; then emit "$stage" failed; fi
+            for control in "${required[@]}"; do emit "$control" "${outcomes[$control]:-not-executed}"; done
+            printf '{"schema":"public-guest-lifecycle/1","required_controls":7,"exit_code":%s,"scope":"diagnostics-only"}\n' "$rc"
+          }
+          trap cleanup EXIT
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm || { emit kvm unavailable; exit 1; }
+          timeout 180 sudo apt-get update -qq
+          timeout 180 sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
+          qemu-system-x86_64 --version
+          base=https://cloud-images.ubuntu.com/releases/noble/release-20240423
+          image=ubuntu-24.04-server-cloudimg-amd64.img
+          stage=image_verification
+          curl --fail --silent --show-error --max-time 30 "$base/SHA256SUMS" -o "$work/SHA256SUMS"
+          curl --fail --silent --show-error --max-time 180 "$base/$image" -o "$work/$image"
+          digest=$(awk -v f="*$image" '$2==f {print $1}' "$work/SHA256SUMS")
+          test "$digest" = 32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+          printf '%s  %s\n' "$digest" "$work/$image" | sha256sum --check --status
+          emit image_verification passed
+          ssh-keygen -q -t ed25519 -N '' -f "$work/key"
+          printf '#cloud-config\nusers:\n  - name: ubuntu\n    groups: sudo\n    shell: /bin/bash\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - %s\nssh_pwauth: false\ndisable_root: true\n' "$(cat "$work/key.pub")" > "$work/user-data"
+          printf 'instance-id: %s\nlocal-hostname: ci-persistence-guest\n' "$uuid" > "$work/meta-data"
+          cloud-localds "$work/seed.img" "$work/user-data" "$work/meta-data"
+          qemu-img create -q -f qcow2 -F qcow2 -b "$work/$image" "$work/disk.qcow2" 8G
+          stage=guest_boot
+          sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 2048 -uuid "$uuid" \
+            -drive "file=$work/disk.qcow2,format=qcow2,if=virtio" -drive "file=$work/seed.img,format=raw,if=virtio" \
+            -netdev user,id=n1,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n1 \
+            -display none -serial "file:$work/serial.log" -daemonize -pidfile "$work/qemu.pid"
+          ssh_opts=(-i "$work/key" -p 2222 -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$work/known_hosts")
+          guest() { timeout 30 ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 "set -e; $*"; }
+          ready() { for i in $(seq 1 90); do if guest true 2>/dev/null; then return; fi; sleep 2; done; return 1; }
+          ready
+          guest 'sudo cloud-init status --wait >/dev/null; test "$(. /etc/os-release; echo "$VERSION_ID")" = 24.04; test "$(uname -m)" = x86_64'
+          emit guest_boot passed
+          # Transfer the exact public tree, including the unchanged resolver/probe.
+          tar -cf "$work/public.tar" .github/workflows/native.yml .gitignore README.md LICENSE LICENSING.md ci/probe.py viewer/tools/posix_shell.py viewer/tools/tests/_bash.py viewer/tools/tests/test_bash_resolver.py
+          timeout 30 scp -q -i "$work/key" -P 2222 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$work/known_hosts" "$work/public.tar" ubuntu@127.0.0.1:public.tar
+          stage=public_resolver
+          guest 'mkdir public; tar -xf public.tar -C public; cd public; PYTHONUTF8=1 python3 ci/probe.py'
+          emit public_resolver passed
+          stage=service_setup
+          guest 'bash -se' <<'GUEST'
+          set -euo pipefail
+          mkdir -p ~/.config/systemd/user ~/lifecycle
+          cat > ~/lifecycle/worker.py <<'WORKER'
+          import os, pathlib, time
+          path = pathlib.Path.home() / "lifecycle/checkpoint"
+          count = int(path.read_text(encoding="utf-8")) if path.exists() else 0
+          (path.parent / "loaded-count").write_text(str(count), encoding="utf-8", newline="\n")
+          while True:
+              count += 1
+              with open(str(path) + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+                  f.write(str(count)); f.flush(); os.fsync(f.fileno())
+              os.replace(str(path) + ".tmp", path)
+              time.sleep(1)
+          WORKER
+          cat > ~/.config/systemd/user/ci-heartbeat.service <<'UNIT'
+          [Unit]
+          Description=Synthetic CI heartbeat
+          [Service]
+          ExecStart=/usr/bin/python3 %h/lifecycle/worker.py
+          Restart=always
+          RestartSec=1
+          [Install]
+          WantedBy=default.target
+          UNIT
+          cat /proc/sys/kernel/random/uuid > ~/lifecycle/disk-token
+          sudo loginctl enable-linger ubuntu
+          systemctl --user daemon-reload
+          echo $$ > ~/lifecycle/launcher.pid
+          systemctl --user enable --now ci-heartbeat.service
+          GUEST
+          snapshot() {
+            guest 'printf "%s %s %s %s %s %s %s %s %s %s\n" "$(cat /proc/sys/kernel/random/boot_id)" "$(cat /etc/machine-id)" "$(sudo cat /sys/class/dmi/id/product_uuid)" "$(id -un):$(id -u)" "$(cat ~/lifecycle/disk-token)" "$(cat ~/lifecycle/checkpoint)" "$(systemctl --user show -p MainPID --value ci-heartbeat.service)" "$(systemctl --user is-enabled ci-heartbeat.service || true)" "$(systemctl --user is-active ci-heartbeat.service || true)" "$(cat ~/lifecycle/loaded-count)"'
+          }
+          record_state() { printf '{"schema":"public-guest-lifecycle/1","phase":"%s","boot":"%s","machine":"%s","vm":"%s","user":"%s","disk_token":"%s","checkpoint":%s,"pid":%s,"enabled":"%s","active":"%s","loaded_count":%s}\n' "$1" "$b" "$m" "$v" "$u" "$d" "$c" "$p" "$e" "$a" "$loaded"; }
+          advance() { for i in $(seq 1 30); do read -r b m v u d c p e a loaded < <(snapshot); if [[ "$c" =~ ^[0-9]+$ ]] && (( c > $1 )) && [ "$a" = active ]; then return; fi; sleep 1; done; return 1; }
+          stage=parent_exit
+          advance 0
+          initial=$c
+          guest 'test ! -e /proc/$(cat ~/lifecycle/launcher.pid); test "$(loginctl show-user ubuntu -p Linger --value)" = yes'
+          advance "$initial"
+          record_state parent_exit
+          emit parent_exit passed
+          stage=supervisor_restart
+          oldpid=$p; initial=$c
+          guest 'systemctl --user kill --kill-whom=main --signal=SIGKILL ci-heartbeat.service'
+          advance "$initial"
+          test "$p" != "$oldpid"; test "$p" -gt 0
+          test "$loaded" -ge "$initial"
+          record_state supervisor_restart
+          emit supervisor_restart passed
+          oldboot=$b; machine=$m; vm=$v; user=$u; disk=$d; initial=$c
+          reboot_guest() {
+            guest 'sudo systemctl reboot' >/dev/null 2>&1 || true
+            for i in $(seq 1 90); do
+              if state=$(snapshot 2>/dev/null); then
+                read -r b m v u d c p e a loaded <<< "$state"
+                if [ "$b" != "$oldboot" ]; then
+                  test "$m $v $u $d" = "$machine $vm $user $disk"; return
+                fi
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          stage=guest_reboot_recovery
+          record_state before_reboot
+          reboot_guest
+          test "$e" = enabled
+          advance "$initial"
+          test "$loaded" -ge "$initial"
+          record_state after_reboot
+          emit guest_reboot_recovery passed
+          stage=explicit_stop_reboot
+          guest 'systemctl --user disable --now ci-heartbeat.service'
+          read -r b m v u d c p e a loaded < <(snapshot)
+          oldboot=$b; stopped=$c
+          reboot_guest
+          test "$e" = disabled; test "$a" = inactive; test "$p" = 0; test "$c" = "$stopped"
+          sleep 5
+          read -r b m v u d c p e a loaded < <(snapshot)
+          test "$e" = disabled; test "$a" = inactive; test "$p" = 0; test "$c" = "$stopped"
+          record_state explicit_stop_reboot
+          emit explicit_stop_reboot passed
+          emit experiment passed
+          printf '%s\n' 'Generic guest diagnostics only; excludes application authentication, trust acceptance, Windows logon, Metal, outer-host reboot and cross-job persistence.' >> "$GITHUB_STEP_SUMMARY"

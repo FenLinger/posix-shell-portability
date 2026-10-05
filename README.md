@@ -1,4 +1,4 @@
-# POSIX shell portability candidate
+# POSIX shell portability
 
 A small Python resolver selects a usable POSIX shell on Linux, macOS and native
 Windows, excluding the System32 WSL launcher. On Windows, install Git for Windows.
@@ -9,14 +9,25 @@ subprocess through a Unicode path containing spaces. The command prints structur
 JSON and fails if a required check fails or skips. Host diagnostics are reported
 separately from test results.
 
-The CI candidate uses standard public Ubuntu, Windows and macOS runners, with at
-most two concurrent jobs and ten minutes per job. It retains results in logs and
-job summaries; it does not upload artifacts or caches. Pushes to `ci-validation`
-run the matrix. Manual dispatch becomes available when the workflow is present
-on the default branch.
+The published resolver matrix uses standard public Ubuntu, Windows and macOS
+runners, with at most two concurrent jobs and ten minutes per matrix job. Pushes
+to `ci-validation` run the matrix. Manual dispatch becomes available when the
+workflow is present on the default branch. Results stay in logs and job summaries;
+no artifacts or caches are uploaded.
 
-These checks cover this resolver only. They do not prove Metal execution,
-application authentication, persistent services, or recovery after reboot/logon.
+The workflow includes an experimental fifteen-minute Ubuntu job after
+the resolver matrix. It boots one disposable Ubuntu 24.04 x86_64 KVM guest with
+at most two virtual CPUs and 2 GiB RAM. A synthetic systemd user heartbeat tests
+launching SSH-parent exit, supervisor restart, recovery across a real reboot of
+the same guest and disk, and explicit stop across a second guest reboot. The
+unchanged public resolver tests and probe also run inside that guest. Nested
+virtualization is experimental; runtime results, including unavailability, are
+required before any environment predicate can be credited.
+
+The lifecycle experiment is generic environment diagnostics. It does not prove
+authenticated application workflows, trust acceptance, Windows
+logon recovery, Metal execution, outer-host reboot, or persistence across CI jobs.
+No private code, credentials or external persistent host is used.
 
 ## Licensing
 
@@ -27,5 +38,6 @@ A **paid proprietary license** is available by separate written agreement with
 the project maintainer. It can provide alternative permissions for uses that
 need proprietary terms. See [LICENSING.md](LICENSING.md) for the licensing options.
 
-This is an unpublished candidate. Publication destination and source ownership
-clearance remain pending.
+The resolver is published at `FenLinger/posix-shell-portability` on
+`ci-validation`. The lifecycle experiment remains unvalidated until actual job
+results establish its declared checks.
