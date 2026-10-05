@@ -236,6 +236,12 @@ jobs:
           old=json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"count":0}
           loaded=old["count"]; count=loaded
           while not (root/"stop-intent").exists():
+              if (root/"crash-request").exists():
+                  assert (root/"crash-request").read_text(encoding="utf-8")==token
+                  (root/"crash-request").unlink()
+                  with open(root/"failure-receipt.json","w",encoding="utf-8",newline="\\n") as f:
+                      json.dump({"token":token,"pid":os.getpid(),"exit_code":23},f); f.flush(); os.fsync(f.fileno())
+                  sys.exit(23)
               count+=1
               data={"count":count,"loaded":loaded,"pid":os.getpid(),"token":token}
               with open(root/"checkpoint.tmp","w",encoding="utf-8",newline="\\n") as f:
@@ -268,10 +274,10 @@ jobs:
                   worker.write_text(WORKER,encoding="utf-8",newline="\n")
                   os.environ.update(CI_CONTROL_TASK=task,CI_CONTROL_PYTHON=sys.executable,
                                     CI_CONTROL_WORKER=str(worker),CI_CONTROL_ROOT=str(root),CI_CONTROL_TOKEN=token)
-                  def emit(control):
-                      outcomes[control]="passed"
+                  def emit(control,outcome="passed"):
+                      outcomes[control]=outcome
                       print(json.dumps({"schema":"hosted-native-lifecycle/1","control":control,
-                                        "outcome":"passed","identity":identity},ensure_ascii=False),flush=True)
+                                        "outcome":outcome,"identity":identity},ensure_ascii=False),flush=True)
                   def state():
                       if not checkpoint.exists():return None
                       value=json.loads(checkpoint.read_text(encoding="utf-8"))
@@ -283,6 +289,9 @@ jobs:
                           value=state()
                           if value and predicate(value):return value
                           time.sleep(1)
+                      if system=="Windows":
+                          diagnostic=ps("$t=Get-ScheduledTask -TaskName $env:CI_CONTROL_TASK; $i=Get-ScheduledTaskInfo -TaskName $env:CI_CONTROL_TASK; [pscustomobject]@{task_state=[string]$t.State;last_result=$i.LastTaskResult;last_run_time=[string]$i.LastRunTime;restart_count=$t.Settings.RestartCount;restart_interval=$t.Settings.RestartInterval} | ConvertTo-Json -Compress",False)
+                          print(json.dumps({"failure_diagnostic":diagnostic.stdout,"worker_state":state(),"identity":identity}),flush=True)
                       raise RuntimeError("Worker observation deadline expired")
                   def snapshot(phase,value):
                       print(json.dumps({"schema":"hosted-native-lifecycle/1","phase":phase,
@@ -333,9 +342,29 @@ jobs:
                       snapshot("after_launcher_exit",second);emit("parent_exit")
                       # Kill only the exact observed fixture process. Real supervisor owns resurrection.
                       if system=="Darwin":os.kill(second["pid"],signal.SIGKILL)
-                      else:ps(f"Stop-Process -Id {second['pid']} -Force")
-                      recovered=wait_state(lambda s:s["pid"]!=second["pid"] and s["loaded"]>=second["count"] and s["count"]>second["count"])
-                      snapshot("after_worker_failure",recovered);emit("checkpoint_reload");emit("supervisor_restart")
+                      else:
+                          # Task Scheduler receives an actual application failure status, rather
+                          # than an external administrative termination/cancellation request.
+                          (root/"crash-request").write_text(token,encoding="utf-8",newline="\n")
+                          deadline=time.monotonic()+30
+                          while not (root/"failure-receipt.json").exists() and time.monotonic()<deadline:time.sleep(.25)
+                          failed=json.loads((root/"failure-receipt.json").read_text(encoding="utf-8"))
+                          assert failed=={"token":token,"pid":second["pid"],"exit_code":23}
+                          ps(f"$deadline=(Get-Date).AddSeconds(15); while((Get-Process -Id {second['pid']} -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {{Start-Sleep -Milliseconds 200}}; if(Get-Process -Id {second['pid']} -ErrorAction SilentlyContinue) {{throw 'Failed worker did not exit'}}")
+                          snapshot("actual_application_failure",failed)
+                          diagnostic=ps("$t=Get-ScheduledTask -TaskName $env:CI_CONTROL_TASK; $i=Get-ScheduledTaskInfo -TaskName $env:CI_CONTROL_TASK; [pscustomobject]@{task_state=[string]$t.State;last_result=$i.LastTaskResult;last_run_time=[string]$i.LastRunTime;restart_count=$t.Settings.RestartCount;restart_interval=$t.Settings.RestartInterval} | ConvertTo-Json -Compress")
+                          print(json.dumps({"failure_diagnostic":diagnostic.stdout,"failure_injection":"application_exit23","identity":identity}),flush=True)
+                      automatic=True
+                      try:
+                          recovered=wait_state(lambda s:s["pid"]!=second["pid"] and s["loaded"]>=second["count"] and s["count"]>second["count"])
+                      except RuntimeError:
+                          if system!="Windows":raise
+                          automatic=False;emit("supervisor_restart","failed")
+                          restart()
+                          recovered=wait_state(lambda s:s["pid"]!=second["pid"] and s["loaded"]>=second["count"] and s["count"]>second["count"],timeout=30)
+                      snapshot("after_worker_failure" if automatic else "manual_recovery_after_auto_failure",recovered)
+                      emit("checkpoint_reload")
+                      if automatic:emit("supervisor_restart")
                       (root/"stop-intent").write_text(token,encoding="utf-8",newline="\n")
                       time.sleep(4); stopped=state()
                       before_invocations={p.name for p in root.glob("invocation-*.json")}
@@ -363,7 +392,7 @@ jobs:
                           assert run(["kill","-0",str(recovered["pid"])],False).returncode!=0
                       else:
                           ps(f"if(Get-Process -Id {recovered['pid']} -ErrorAction SilentlyContinue) {{throw 'Worker still alive'}}")
-                      emit("unregister_cleanup");rc=0
+                      emit("unregister_cleanup");rc=0 if set(outcomes)==REQUIRED and all(v=="passed" for v in outcomes.values()) else 1
                   finally:
                       if registered:
                           try:unregister()
@@ -400,9 +429,43 @@ jobs:
           import threading
           import time
           
+          def owned_windows_processes(parent):
+              if os.name!="nt":return []
+              command="$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,@{n='created';e={if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null}}} | ConvertTo-Json -Compress"
+              r=subprocess.run(["powershell.exe","-NoProfile","-NonInteractive","-Command",command],capture_output=True,encoding="utf-8",timeout=30)
+              if r.returncode:raise RuntimeError("Could not inventory owned native descendants")
+              rows=json.loads(r.stdout)
+              if not isinstance(rows,list):raise RuntimeError("Invalid native process inventory")
+              found={parent};owned=[]
+              while True:
+                  new=[p for p in rows if p["ParentProcessId"] in found and p["ProcessId"] not in found]
+                  if not new:return owned
+                  if any(not isinstance(p.get("created"),str) or not p["created"] or not isinstance(p.get("Name"),str) for p in new):
+                      raise RuntimeError("Owned native descendant identity is unavailable")
+                  owned+=new;found.update(p["ProcessId"] for p in new)
+          
+          def cleanup_owned_windows_processes(owned):
+              # PID plus creation time protects against PID reuse. Never target arbitrary Git processes.
+              time.sleep(2)
+              for p in owned:
+                  pid=int(p["ProcessId"]);created=p["created"]
+                  command=f"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if($p) {{if(-not $p.CreationDate) {{throw 'Owned helper identity unavailable'}}; if($p.CreationDate.ToUniversalTime().ToString('o') -eq '{created}') {{Stop-Process -Id {pid} -Force; Start-Sleep -Milliseconds 200; if(Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{throw 'Owned helper survived cleanup'}}; Write-Output 'terminated-owned-helper'}} else {{Write-Output 'PID-reused-original-helper-gone'}}}} else {{Write-Output 'already-exited'}}"
+                  r=subprocess.run(["powershell.exe","-NoProfile","-NonInteractive","-Command",command],capture_output=True,encoding="utf-8",timeout=30)
+                  if r.returncode:raise RuntimeError("Owned native helper cleanup failed")
+                  print(json.dumps({"schema":"native-catalog/1","helper_pid":pid,"helper_name":p["Name"],"cleanup":r.stdout.strip() or "already-exited"}),flush=True)
+          
+          class BoundedDirectory(tempfile.TemporaryDirectory):
+              def cleanup(self):
+                  for attempt in range(40):
+                      try:
+                          super().cleanup();return
+                      except PermissionError:
+                          if attempt==39:raise
+                          time.sleep(.25)
+          
           def main():
               node_cli=Path(sys.argv[1]).resolve()
-              with tempfile.TemporaryDirectory(prefix="codex catalog space ") as temp:
+              with BoundedDirectory(prefix="codex catalog space ") as temp:
                   root=Path(temp); profile=root/"profile";profile.mkdir()
                   cwd=root/"fixture";cwd.mkdir()
                   skill=cwd/".agents/skills/ci-control/SKILL.md";skill.parent.mkdir(parents=True)
@@ -423,7 +486,8 @@ jobs:
                               try:q.put(json.loads(line))
                               except json.JSONDecodeError:q.put({"invalid":line})
                           q.put({"eof":True})
-                      threading.Thread(target=reader,daemon=True).start()
+                      reader_thread=threading.Thread(target=reader,daemon=True);reader_thread.start()
+                      owned=[]
                       def send(message):proc.stdin.write(json.dumps(message)+"\n");proc.stdin.flush()
                       def request(ident,method,params):
                           send({"id":ident,"method":method,"params":params});deadline=time.monotonic()+45
@@ -442,11 +506,31 @@ jobs:
                           assert len(matches)==1 and Path(matches[0]["path"]).resolve()==skill.resolve()
                           print(json.dumps({"schema":"native-catalog/1","control":"actual_native_skill_discovery","outcome":"passed","skill":matches[0],"authentication":"isolated profile; no model turn attempted"}),flush=True)
                       finally:
-                          proc.stdin.close()
-                          try:rc=proc.wait(timeout=15)
-                          except subprocess.TimeoutExpired:proc.terminate();proc.wait(timeout=15);raise RuntimeError("Native catalog server needed forced termination")
-                      assert rc==0
+                          inventory_error=None;forced_owner=False
+                          try:
+                              for attempt in range(2):
+                                  snapshot=owned_windows_processes(proc.pid)
+                                  owned=list({(p["ProcessId"],p["created"]):p for p in owned+snapshot}.values())
+                                  if attempt==0:time.sleep(.25)
+                          except Exception as error:inventory_error=error
+                          finally:
+                              proc.stdin.close()
+                              try:
+                                  try:rc=proc.wait(timeout=15)
+                                  except subprocess.TimeoutExpired:
+                                      forced_owner=True;proc.terminate();rc=proc.wait(timeout=15)
+                              finally:
+                                  cleanup_owned_windows_processes(owned)
+                                  reader_thread.join(timeout=2)
+                                  assert not reader_thread.is_alive(), "Native stdout still held by an unclosed process"
+                                  proc.stdout.close()
+                          if inventory_error:raise inventory_error
+                          if forced_owner:raise RuntimeError("Native catalog server needed forced termination")
+                          assert rc==0
                       print(json.dumps({"schema":"native-catalog/1","control":"native_server_close","outcome":"passed","exit_code":rc}),flush=True)
+          
+              assert not Path(temp).exists()
+              print(json.dumps({"schema":"native-catalog/1","control":"fixture_cleanup","outcome":"passed"}),flush=True)
           
           if __name__=="__main__":main()
           CATALOG_PROBE
