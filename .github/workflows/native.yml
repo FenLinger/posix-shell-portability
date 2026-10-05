@@ -68,11 +68,15 @@ jobs:
           base=https://cloud-images.ubuntu.com/releases/noble/release-20240423
           image=ubuntu-24.04-server-cloudimg-amd64.img
           stage=image_verification
-          curl --fail --silent --show-error --max-time 30 "$base/SHA256SUMS" -o "$work/SHA256SUMS"
-          curl --fail --silent --show-error --max-time 180 "$base/$image" -o "$work/$image"
+          curl --location --fail --silent --show-error --max-time 30 "$base/SHA256SUMS" -o "$work/SHA256SUMS"
+          curl --location --fail --silent --show-error --max-time 180 "$base/$image" -o "$work/$image"
           digest=$(awk -v f="*$image" '$2==f {print $1}' "$work/SHA256SUMS")
-          test "$digest" = 32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
-          printf '%s  %s\n' "$digest" "$work/$image" | sha256sum --check --status
+          expected_digest=32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+          image_bytes=$(stat -c %s "$work/$image")
+          actual_digest=$(sha256sum "$work/$image" | awk '{print $1}')
+          printf 'Image verification: bytes=%s expected=%s checksum_list=%s downloaded=%s\n' "$image_bytes" "$expected_digest" "$digest" "$actual_digest"
+          test "$digest" = "$expected_digest" || { emit checksum_list failed; exit 1; }
+          test "$actual_digest" = "$expected_digest" || { emit image_digest failed; exit 1; }
           emit image_verification passed
           ssh-keygen -q -t ed25519 -N '' -f "$work/key"
           printf '#cloud-config\nusers:\n  - name: ubuntu\n    groups: sudo\n    shell: /bin/bash\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - %s\nssh_pwauth: false\ndisable_root: true\n' "$(cat "$work/key.pub")" > "$work/user-data"
