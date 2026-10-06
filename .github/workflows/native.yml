@@ -3,6 +3,21 @@ on:
   push:
     branches: [ci-validation]
   workflow_dispatch:
+    inputs:
+      case_id:
+        description: Fixed public reproducer case ID
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - viewer/tools/tests/test_bash_resolver.py::TheResolverPrefersTheShebangsShellThenGitsBash::test_bin_bash_wins_where_it_exists
+          - viewer/tools/tests/test_bash_resolver.py::TheResolverPrefersTheShebangsShellThenGitsBash::test_without_bin_bash_the_bash_beside_git_is_chosen
+          - viewer/tools/tests/test_bash_resolver.py::TheResolverPrefersTheShebangsShellThenGitsBash::test_the_wsl_stub_is_never_chosen
+          - viewer/tools/tests/test_bash_resolver.py::TheResolverPrefersTheShebangsShellThenGitsBash::test_a_plain_bash_on_path_is_the_last_resort
+          - viewer/tools/tests/test_bash_resolver.py::TheResolverPrefersTheShebangsShellThenGitsBash::test_the_live_resolution_is_usable_here
+          - ci/probe.py::main
+          - fixture::unicode-space-crlf-lf-executable
 permissions:
   contents: read
 jobs:
@@ -21,8 +36,375 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+          fetch-depth: 2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.11.9'
-      - name: Tests and host diagnostics
-        run: python ci/probe.py
+      - name: Public native proof and host diagnostics
+        shell: bash
+        env:
+          T21_MATRIX_OS: ${{ matrix.os }}
+          T21_CASE_ID: ${{ inputs.case_id || 'all' }}
+          T21_PUSH_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python - <<'PYCODE'
+          import hashlib
+          import io
+          import json
+          import os
+          import platform
+          from pathlib import Path
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import unittest
+          from datetime import datetime, timedelta, timezone
+          
+          
+          ROOT = Path.cwd()
+          PROFILE = {"ubuntu-24.04": "linux-native", "windows-2022": "windows-native",
+                     "macos-15": "macos-native"}[os.environ["T21_MATRIX_OS"]]
+          CASES = (
+              "test_bin_bash_wins_where_it_exists",
+              "test_without_bin_bash_the_bash_beside_git_is_chosen",
+              "test_the_wsl_stub_is_never_chosen",
+              "test_a_plain_bash_on_path_is_the_last_resort",
+              "test_the_live_resolution_is_usable_here",
+          )
+          TEST_CLASS = "TheResolverPrefersTheShebangsShellThenGitsBash"
+          SOURCE_PATHS = (
+              ".github/workflows/native.yml", ".gitignore", "LICENSE", "LICENSING.md", "README.md",
+              "ci/probe.py", "viewer/tools/posix_shell.py", "viewer/tools/tests/_bash.py",
+              "viewer/tools/tests/test_bash_resolver.py",
+          )
+          EXPECTED_WINDOWS_STDOUT = "héllo X\n"
+          
+          
+          def stamp():
+              return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+          
+          
+          def canonical(value):
+              return (json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+          
+          
+          def sha(raw):
+              return hashlib.sha256(raw).hexdigest()
+          
+          
+          def artifact_path(path):
+              return path.as_posix()
+          
+          
+          def push_selection(message, case_ids):
+              lines = message.splitlines()
+              markers = [index for index, line in enumerate(lines) if "t21-case:" in line]
+              if not markers:
+                  return "all"
+              if markers != [0] or not lines[0].startswith("t21-case: "):
+                  raise ValueError("misplaced or repeated public reproducer marker")
+              selected = lines[0].removeprefix("t21-case: ")
+              if selected not in {"all", *case_ids}:
+                  raise ValueError("unregistered public reproducer case ID")
+              return selected
+          
+          
+          def checked(argv):
+              return subprocess.run(argv, cwd=ROOT, check=True, capture_output=True).stdout
+          
+          
+          def emit(label, raw):
+              print("T21_" + label + "_BEGIN", flush=True)
+              sys.stdout.buffer.write(raw)
+              sys.stdout.flush()
+              print("T21_" + label + "_END", flush=True)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8", newline="\n") as out:
+                      out.write("### T21 " + label + "\n```json\n" + raw.decode("utf-8") + "```\n")
+          
+          
+          def command(argv, timeout=20):
+              start = time.monotonic()
+              try:
+                  result = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=timeout)
+                  return {"exit": result.returncode,
+                          "stdout": result.stdout[:65536].decode("utf-8", "replace"),
+                          "stderr": result.stderr[:65536].decode("utf-8", "replace"),
+                          "stdout_sha256": sha(result.stdout), "stderr_sha256": sha(result.stderr),
+                          "seconds": time.monotonic() - start}
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  return {"exit": None, "error": str(error), "seconds": time.monotonic() - start}
+          
+          
+          def executable(name):
+              found = shutil.which(name)
+              if not found:
+                  return None
+              path = Path(found).resolve()
+              raw = path.read_bytes() if path.is_file() else b""
+              return {"path": artifact_path(path), "sha256": sha(raw) if raw else None,
+                      "regular": path.is_file(), "version": command([str(path), "--version"]).get("stdout", "")[:200]}
+          
+          
+          def source():
+              rows = {}
+              for entry in checked(["git", "ls-tree", "-rz", "HEAD"]).split(b"\x00"):
+                  if not entry:
+                      continue
+                  meta, name = entry.split(b"\t", 1)
+                  mode, kind, blob = meta.decode("ascii").split(" ")
+                  path = name.decode("utf-8")
+                  if kind != "blob" or path not in SOURCE_PATHS:
+                      raise RuntimeError("unreviewed tracked source path: " + path)
+                  committed = checked(["git", "show", "HEAD:" + path])
+                  disk = (ROOT / path).read_bytes()
+                  transformed = disk != committed
+                  if transformed and not (PROFILE == "windows-native"
+                                          and disk == committed.replace(b"\n", b"\r\n")):
+                      raise RuntimeError("unexplained worktree byte transform: " + path)
+                  rows[path] = {"mode": mode, "blob": blob, "sha256": sha(committed),
+                                "disk_sha256": sha(disk),
+                                "checkout_transform": "lf-to-crlf" if transformed else "identity"}
+              if set(rows) != set(SOURCE_PATHS):
+                  raise RuntimeError("missing approved tracked source path")
+              return dict(sorted(rows.items()))
+          
+          
+          def case_record(case_id, status, exit_code, details):
+              return {"case_id": case_id, "status": status, "exit": exit_code,
+                      "details": details}
+          
+          
+          def unittest_case(name):
+              case_id = "viewer/tools/tests/test_bash_resolver.py::" + TEST_CLASS + "::" + name
+              output = io.StringIO()
+              suite = unittest.defaultTestLoader.loadTestsFromName("test_bash_resolver." + TEST_CLASS + "." + name)
+              result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
+              if result.testsRun != 1:
+                  status = "missing"
+              elif result.skipped:
+                  status = "skipped"
+              elif result.failures or result.errors or not result.wasSuccessful():
+                  status = "failed"
+              else:
+                  status = "passed"
+              return case_record(case_id, status, 0 if status == "passed" else 1 if status == "failed" else None,
+                                 {"tests_run": result.testsRun, "failures": len(result.failures),
+                                  "errors": len(result.errors), "skips": len(result.skipped),
+                                  "log": output.getvalue()[:12000]})
+          
+          
+          def probe_case():
+              observed = command([sys.executable, "ci/probe.py"], timeout=90)
+              try:
+                  payload = json.loads(observed["stdout"])
+                  passed = (observed["exit"] == 0 and payload["passed"] is True
+                            and payload["tests"]["executed"] == 5
+                            and payload["tests"]["failures"] == 0 and payload["tests"]["errors"] == 0
+                            and payload["tests"]["skips"] == 0 and payload["unicode_subprocess"]["passed"] is True
+                            and payload["diagnostics"]["git"]["exit"] == 0
+                            and (PROFILE != "windows-native" or payload["diagnostics"]["powershell"]["exit"] == 0))
+              except (KeyError, ValueError, TypeError):
+                  passed = False
+              return case_record("ci/probe.py::main", "passed" if passed else "failed" if observed["exit"] is not None else "unavailable",
+                                 observed.get("exit"), observed)
+          
+          
+          def unicode_case():
+              sys.path.insert(0, str(ROOT / "viewer/tools"))
+              from posix_shell import posix_shell
+              bash = posix_shell()
+              if not bash:
+                  return case_record("fixture::unicode-space-crlf-lf-executable", "unavailable", None,
+                                     {"reason": "Bash unresolved"})
+              bash_path = Path(bash)
+              bash_stat = bash_path.lstat()
+              executable_ok = (stat.S_ISREG(bash_stat.st_mode) and not bash_path.is_symlink()
+                               and os.access(bash_path, os.X_OK)
+                               and "Windows/System32/bash.exe" not in str(bash_path).replace("\\", "/"))
+              with tempfile.TemporaryDirectory(prefix="public λ space ") as directory:
+                  script = Path(directory) / "Unicode λ script.sh"
+                  script.write_bytes("printf '%s\\n' 'héllo λ'\r\n".encode("utf-8"))
+                  crlf_before = b"\r\n" in script.read_bytes()
+                  script.write_bytes(script.read_bytes().replace(b"\r\n", b"\n"))
+                  normalized = b"\r" not in script.read_bytes()
+                  observed = command([bash, script.as_posix()])
+              expected = "héllo λ\n"
+              if PROFILE == "windows-native":
+                  expected = EXPECTED_WINDOWS_STDOUT
+              passed = (crlf_before and normalized and executable_ok and observed["exit"] == 0
+                        and observed["stdout"] == expected and observed["stderr"] == "")
+              details = {"expected_stdout": expected, "crlf_before": crlf_before,
+                         "normalized_lf": normalized, "regular_executable": executable_ok,
+                         "bash": artifact_path(bash_path), "bash_sha256": sha(bash_path.read_bytes()),
+                         "observed": observed}
+              return case_record("fixture::unicode-space-crlf-lf-executable",
+                                 "passed" if passed else "failed", observed["exit"], details)
+          
+          
+          def main():
+              sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+              python_version = platform.python_version()
+              if python_version != "3.11.9" or not sys.version.startswith("3.11.9 "):
+                  raise RuntimeError("native Python must be exactly 3.11.9")
+              rows = source()
+              head = checked(["git", "rev-parse", "HEAD"]).decode().strip()
+              parent = checked(["git", "rev-parse", "HEAD^"]).decode().strip()
+              tree = checked(["git", "rev-parse", "HEAD^{tree}"]).decode().strip()
+              repository = os.environ["GITHUB_REPOSITORY"]
+              if (os.environ["GITHUB_REF"] != "refs/heads/ci-validation"
+                      or os.environ["GITHUB_SHA"] != head
+                      or os.environ["GITHUB_EVENT_NAME"] not in ("push", "workflow_dispatch")):
+                  raise RuntimeError("public validation ref/head/event mismatch")
+              run_id = os.environ["GITHUB_RUN_ID"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              run_key = run_id + ":" + attempt + ":" + PROFILE
+              run_url = "https://github.com/" + repository + "/actions/runs/" + run_id
+              workflow_sha = rows[".github/workflows/native.yml"]["sha256"]
+              python_path = Path(sys.executable).resolve()
+              runtime_detail = {"image_os": os.environ.get("ImageOS"),
+                                "image_version": os.environ.get("ImageVersion"),
+                                "runner_os": os.environ.get("RUNNER_OS"),
+                                "runner_arch": os.environ.get("RUNNER_ARCH"),
+                                "python_version": python_version,
+                                "python_build": platform.python_build(),
+                                "python_executable": artifact_path(python_path),
+                                "python_sha256": sha(python_path.read_bytes()),
+                                "git": executable("git"), "bash": executable("bash"),
+                                "systemctl": executable("systemctl") if PROFILE == "linux-native" else None,
+                                "sw_vers": executable("sw_vers") if PROFILE == "macos-native" else None,
+                                "powershell": executable("powershell.exe") if PROFILE == "windows-native" else None,
+                                "github_workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
+                                "github_workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA")}
+              runtime_sha = sha(canonical(runtime_detail))
+              runtime = {"profile": PROFILE, "host_id": "github-hosted:" + run_key,
+                         "os": sys.platform, "architecture": platform.machine(),
+                         "python": sys.version, "node": None, "codex": None, "model": None,
+                         "effort": None, "dependency_lock_sha256": workflow_sha,
+                         "hardware_id": None, "backend_runtime": None,
+                         "interactive_identity": None, "runtime_sha256": runtime_sha}
+              test_ids = ["viewer/tools/tests/test_bash_resolver.py::" + TEST_CLASS + "::" + name
+                          for name in CASES] + ["ci/probe.py::main", "fixture::unicode-space-crlf-lf-executable"]
+              selected_case_id = (push_selection(os.environ["T21_PUSH_MESSAGE"], test_ids)
+                                  if os.environ["GITHUB_EVENT_NAME"] == "push"
+                                  else os.environ.get("T21_CASE_ID") or "all")
+              if selected_case_id not in {"all", *test_ids}:
+                  raise RuntimeError("unregistered public reproducer case ID")
+              closure = {"source": rows, "runtime": runtime_detail, "test_ids": test_ids,
+                         "selected_case_id": selected_case_id,
+                         "fixture_source": "printf '%s\\n' 'héllo λ'\n",
+                         "recipe": "checkout-depth2+setup-python-3.11.9+stdlib-inline-v1"}
+              scope = {"kind": "content-only", "id": "public-nine-native-" + PROFILE,
+                       "declared_paths": list(SOURCE_PATHS), "closure_sha256": sha(canonical(closure)),
+                       "closure_complete": True,
+                       "input_sha256": sha(canonical({"source": rows, "selected_case_id": selected_case_id})),
+                       "dependency_sha256": runtime_sha,
+                       "test_sha256": sha(canonical({"ids": test_ids, "fixture": closure["fixture_source"],
+                                                      "selected_case_id": selected_case_id})),
+                       "policy_sha256": workflow_sha}
+              producer = {"identity": "github-actions-public-hosted", "workflow_revision": head,
+                          "workflow_sha256": workflow_sha, "authenticated_route": "github-actions-public-hosted",
+                          "authority_record_ref": "public-git:" + head + ":.github/workflows/native.yml",
+                          "attestation_ref": run_url + "/attempts/" + attempt}
+              now = datetime.now(timezone.utc)
+              freshness = {"policy_id": "ticket21-original-no-reuse-v1",
+                           "valid_until": (now + timedelta(hours=24)).isoformat(timespec="microseconds"),
+                           "max_skips": 0, "skips_since_execution": 0, "forced_run": True,
+                           "revocation_checked_at": None, "revoked": False}
+              frozen = {"schema_version": "codex-ticket-evidence/1.0.0", "record_type": "frozen-run",
+                        "record_id": "public-frozen:" + run_key, "run_id": run_key,
+                        "repository_identity": repository, "candidate_sha": head, "created_at": stamp(),
+                        "producer": producer, "verified_remote_identity": "https://github.com/" + repository,
+                        "base_sha": parent, "target_refspec": os.environ["GITHUB_REF"],
+                        "worktree_snapshot_sha256": sha(canonical({p: row["disk_sha256"] for p, row in rows.items()})),
+                        "index_tree_sha": tree, "input_snapshot_sha256": scope["input_sha256"],
+                        "scopes": [scope], "required_predicates": [{"predicate_id": "public-native-shell",
+                        "scope_id": scope["id"], "profiles": [PROFILE], "owner_ticket": 21,
+                        "route": "public-hosted-cleared"}], "dependencies": [],
+                        "preflight": {"predicate_ids": ["public-native-shell"],
+                        "counts": {"required": 1, "discovered": 0, "executed": 0, "passed": 0,
+                                   "failed": 0, "unavailable": 0, "refused": 0, "skipped": 0, "missing": 1},
+                        "proof_refs": [], "status": "missing"}, "freshness_policy": freshness,
+                        "acquisition_ref": run_url + "/attempts/" + attempt,
+                        "scope_declaration_ref": "public-log:scope:" + run_key,
+                        "trusted_coordinator_authority_ref": "public-git:" + head + ":.github/workflows/native.yml"}
+              frozen_bytes = canonical(frozen)
+              emit("FROZEN", frozen_bytes)
+              start = stamp()
+              start_clock = time.monotonic()
+              sys.path.insert(0, str(ROOT / "viewer/tools/tests"))
+              cases = []
+              for name in CASES:
+                  case_id = "viewer/tools/tests/test_bash_resolver.py::" + TEST_CLASS + "::" + name
+                  if selected_case_id not in ("all", case_id):
+                      cases.append(case_record(case_id, "missing", None,
+                                               {"reason": "not selected by bounded reproducer"}))
+                      continue
+                  try:
+                      cases.append(unittest_case(name))
+                  except (OSError, ValueError, TypeError, RuntimeError) as error:
+                      cases.append(case_record(case_id, "unavailable", None, {"error": str(error)[:300]}))
+              for case_id, run_case in (("ci/probe.py::main", probe_case),
+                                        ("fixture::unicode-space-crlf-lf-executable", unicode_case)):
+                  if selected_case_id not in ("all", case_id):
+                      cases.append(case_record(case_id, "missing", None,
+                                               {"reason": "not selected by bounded reproducer"}))
+                      continue
+                  try:
+                      cases.append(run_case())
+                  except (OSError, ValueError, TypeError, RuntimeError) as error:
+                      cases.append(case_record(case_id, "unavailable", None, {"error": str(error)[:300]}))
+              finish = stamp()
+              compute = time.monotonic() - start_clock
+              diagnostics = {"schema": "public-native-diagnostics/1", "run_id": run_key,
+                             "profile": PROFILE, "selected_case_id": selected_case_id,
+                             "source": rows, "runtime": runtime_detail,
+                             "cases": cases, "source_tree": tree, "source_head": head,
+                             "started_at": start, "finished_at": finish}
+              diagnostics_bytes = canonical(diagnostics)
+              emit("DIAGNOSTICS", diagnostics_bytes)
+              statuses = [case["status"] for case in cases]
+              counts = {name: len(cases) if name in ("required", "discovered") else
+                        sum(case["status"] in ("passed", "failed") for case in cases) if name == "executed"
+                        else statuses.count(name) for name in
+                        ("required", "discovered", "executed", "passed", "failed",
+                         "unavailable", "refused", "skipped", "missing")}
+              passed = all(status == "passed" for status in statuses)
+              output_path = "public-log/diagnostics.json"
+              proof = {"schema_version": "codex-ticket-evidence/1.0.0", "record_type": "predicate-proof",
+                       "record_id": "public-proof:" + run_key, "run_id": run_key,
+                       "repository_identity": repository, "candidate_sha": head, "created_at": stamp(),
+                       "producer": producer, "predicate_id": "public-native-shell", "scope": scope,
+                       "source_run_id": run_key, "source_candidate_sha": head,
+                       "source_manifest": {"record_id": frozen["record_id"],
+                                           "ref": "public-log:frozen:" + run_key,
+                                           "sha256": sha(frozen_bytes)},
+                       "runtime": runtime, "counts": counts,
+                       "children": [{"case_id": case["case_id"], "profile": PROFILE,
+                                     "status": case["status"], "exit": case["exit"],
+                                     "output_refs": [output_path], "semantic_verdict": case["status"]}
+                                    for case in cases], "actual_exit": 0 if passed else 1,
+                       "severity": "error", "semantic_verdict": "passed" if passed else "failed",
+                       "started_at": start, "finished_at": finish,
+                       "outputs": [{"path": output_path, "sha256": sha(diagnostics_bytes),
+                                    "bytes": len(diagnostics_bytes), "media_type": "application/json",
+                                    "visibility": "public-cleared", "produced_by": producer["identity"]}],
+                       "freshness": freshness,
+                       "failure_controls": [{"control_id": "native-windows-unicode-expected-literal",
+                                             "expected": "failed" if PROFILE == "windows-native" and EXPECTED_WINDOWS_STDOUT != "héllo λ\n" else "passed",
+                                             "observed": cases[-1]["status"], "output_refs": [output_path]}],
+                       "timings": {"setup_seconds": None, "queue_seconds": None,
+                                   "compute_seconds": compute, "transport_seconds": None,
+                                   "verification_seconds": None, "total_seconds": None}}
+              emit("PROOF", canonical(proof))
+              return 0 if passed else 1
+          
+          
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYCODE
