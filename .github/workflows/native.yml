@@ -80,7 +80,7 @@ jobs:
               "ci/probe.py", "viewer/tools/posix_shell.py", "viewer/tools/tests/_bash.py",
               "viewer/tools/tests/test_bash_resolver.py",
           )
-          EXPECTED_WINDOWS_STDOUT = "héllo X\n"
+          EXPECTED_WINDOWS_STDOUT = "héllo λ\n"
           
           
           def stamp():
